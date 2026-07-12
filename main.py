@@ -172,7 +172,8 @@ def get_latest_videos(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR) -> 
             "resultsType": "posts",
             "resultsLimit": limit,  # only the absolute latest posts — conserves Apify credits
             "addParentData": False,
-        }
+        },
+        logger=None,  # don't stream actor logs — keeps CI output readable
     )
 
     if run is None:
