@@ -283,13 +283,20 @@ def _chunk_text(text: str, size: int = NOTION_TEXT_CHUNK) -> list[str]:
 
 
 def already_in_notion(notion: NotionClient, url: str) -> bool:
-    """Skip videos that already have a page (keeps scheduled runs idempotent)."""
-    result = notion.databases.query(
-        database_id=NOTION_DATABASE_ID,
-        filter={"property": "Instagram URL", "url": {"equals": url}},
-        page_size=1,
+    """Skip videos that already have a page (keeps scheduled runs idempotent).
+
+    Uses the raw request method — the installed notion-client version does not
+    expose databases.query().
+    """
+    response = notion.request(
+        path=f"databases/{NOTION_DATABASE_ID}/query",
+        method="POST",
+        body={
+            "filter": {"property": "Instagram URL", "url": {"equals": url}},
+            "page_size": 1,
+        },
     )
-    return len(result.get("results", [])) > 0
+    return len(response.get("results", [])) > 0
 
 
 def sync_to_notion(notion: NotionClient, username: str, url: str, script: str) -> None:
