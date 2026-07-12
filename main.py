@@ -2,9 +2,11 @@
 Automated Instagram -> Notion content pipeline (profile monitoring).
 
 Flow (per creator in creators.txt):
-    1. Apify (instagram-scraper actor) lists the latest 3 videos on the profile
+    1. Apify (instagram-scraper actor) returns the latest video post,
+       including a direct CDN videoUrl (no Instagram frontend involved)
     2. Videos already present in Notion are skipped (duplicate check by URL)
-    3. yt-dlp downloads each new video's audio into ./tmp_media
+    3. The video is downloaded straight from the Apify videoUrl into
+       ./tmp_media via plain HTTP (requests)
     4. Groq (Whisper large v3) transcribes the audio in Urdu
     5. Gemini rewrites it as a condensed Roman Urdu script
        (link on top + 4-line hook + script body)
@@ -12,7 +14,8 @@ Flow (per creator in creators.txt):
     7. Media file is permanently deleted (zero retention)
 
 Secrets come exclusively from environment variables:
-    GEMINI_API_KEY, GROQ_API_KEY, NOTION_DATABASE_ID, NOTION_API_KEY
+    GEMINI_API_KEY, GROQ_API_KEY, NOTION_DATABASE_ID, NOTION_API_KEY,
+    APIFY_API_TOKEN
 """
 
 import logging
@@ -21,12 +24,12 @@ import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
+import requests
 from apify_client import ApifyClient
 from dotenv import load_dotenv
 from google import genai
 from groq import Groq
 from notion_client import Client as NotionClient
-import yt_dlp
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -38,20 +41,21 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-IG_COOKIES = os.getenv("IG_COOKIES")
 APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN")
 
 BASE_DIR = Path(__file__).resolve().parent
 MEDIA_DIR = BASE_DIR / "tmp_media"
 LOG_DIR = BASE_DIR / "logs"
 CREATORS_FILE = BASE_DIR / "creators.txt"
-COOKIES_FILE = BASE_DIR / "cookies.txt"
 
 GROQ_WHISPER_MODEL = "whisper-large-v3"
 GEMINI_MODEL = "gemini-2.5-flash"
 APIFY_INSTAGRAM_ACTOR = "apify/instagram-scraper"
 
-LATEST_VIDEOS_PER_CREATOR = 3
+# Process only the single latest video per creator for now (may increase later).
+LATEST_VIDEOS_PER_CREATOR = 1
+
+DOWNLOAD_TIMEOUT_SECONDS = 120
 
 # Notion caps a single rich_text element at 2000 characters.
 NOTION_TEXT_CHUNK = 2000
@@ -131,40 +135,6 @@ log = setup_logging()
 
 
 # ---------------------------------------------------------------------------
-# Instagram authentication cookies
-# ---------------------------------------------------------------------------
-
-def write_cookies_file() -> bool:
-    """Write the IG_COOKIES secret to cookies.txt for yt-dlp authentication."""
-    if not IG_COOKIES:
-        log.warning(
-            "IG_COOKIES is not set — yt-dlp will run unauthenticated and may "
-            "hit 429 errors."
-        )
-        return False
-    COOKIES_FILE.write_text(IG_COOKIES, encoding="utf-8")
-    log.info("Wrote Instagram cookies to %s", COOKIES_FILE.name)
-    return True
-
-
-def delete_cookies_file() -> None:
-    """Remove cookies.txt so sensitive cookies never linger on the runner."""
-    try:
-        COOKIES_FILE.unlink(missing_ok=True)
-        log.info("Deleted cookies file.")
-    except OSError as exc:
-        log.error("Failed to delete cookies file: %s", exc)
-
-
-def _ydl_opts(**extra) -> dict:
-    """Base yt-dlp options, including the cookie file when available."""
-    opts = {"quiet": True, **extra}
-    if COOKIES_FILE.exists():
-        opts["cookiefile"] = str(COOKIES_FILE)
-    return opts
-
-
-# ---------------------------------------------------------------------------
 # Pipeline steps
 # ---------------------------------------------------------------------------
 
@@ -182,13 +152,12 @@ def load_creators() -> list[str]:
     return creators
 
 
-def get_latest_video_urls(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR) -> list[str]:
-    """List the latest `limit` video URLs from a creator's profile via Apify.
+def get_latest_videos(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR) -> list[dict]:
+    """List the latest `limit` videos from a creator's profile via Apify.
 
-    GitHub Actions IPs are blocked by Instagram (403 even with cookies), so
-    profile listing runs through Apify's instagram-scraper actor, which uses
-    residential proxies. yt-dlp is still used to download the individual
-    video URLs returned here.
+    GitHub Actions IPs are blocked by Instagram, so scraping runs through
+    Apify's instagram-scraper actor (residential proxies). Each returned dict
+    has: url (post page), video_url (direct CDN media), shortcode.
     """
     client = ApifyClient(APIFY_API_TOKEN)
     run = client.actor(APIFY_INSTAGRAM_ACTOR).call(
@@ -203,55 +172,61 @@ def get_latest_video_urls(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR)
     if run is None:
         raise RuntimeError(f"Apify actor run failed for @{username}")
 
-    urls: list[str] = []
+    videos: list[dict] = []
     # apify-client returns a Run object — access fields as attributes.
     for item in client.dataset(run.default_dataset_id).iterate_items():
         # Actor marks post types as "Video" / "Image" / "Sidecar".
         if item.get("type") != "Video":
             continue
-        url = item.get("url")
-        if not url and item.get("shortCode"):
-            url = f"https://www.instagram.com/p/{item['shortCode']}/"
-        if url:
-            urls.append(url)
-            if len(urls) >= limit:
-                break
+        shortcode = item.get("shortCode", "")
+        url = item.get("url") or (
+            f"https://www.instagram.com/p/{shortcode}/" if shortcode else None
+        )
+        video_url = item.get("videoUrl")
+        if not url:
+            continue
+        if not video_url:
+            log.warning("No videoUrl in Apify result for %s — skipping.", url)
+            continue
+        videos.append({"url": url, "video_url": video_url, "shortcode": shortcode})
+        if len(videos) >= limit:
+            break
 
-    log.info("Found %d latest video(s) for @%s", len(urls), username)
-    return urls
+    log.info("Found %d latest video(s) for @%s", len(videos), username)
+    return videos
 
 
-def download_audio(url: str) -> Path:
-    """Download the video's audio into tmp_media. Returns the file path."""
+def download_video(video_url: str, shortcode: str) -> Path:
+    """Download the video straight from the Apify-provided CDN URL."""
     MEDIA_DIR.mkdir(exist_ok=True)
-    ydl_opts = _ydl_opts(
-        format="bestaudio/best",
-        outtmpl=str(MEDIA_DIR / "%(id)s.%(ext)s"),
-        postprocessors=[
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "128",
-            }
-        ],
-        noplaylist=True,
+    media_path = MEDIA_DIR / f"{shortcode or 'video'}.mp4"
+    with requests.get(
+        video_url, stream=True, timeout=DOWNLOAD_TIMEOUT_SECONDS
+    ) as response:
+        response.raise_for_status()
+        with open(media_path, "wb") as fh:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                fh.write(chunk)
+
+    if media_path.stat().st_size == 0:
+        raise ValueError(f"Downloaded file is empty: {media_path}")
+    log.info(
+        "Downloaded video %s (%.1f MB)",
+        media_path.name,
+        media_path.stat().st_size / 1_048_576,
     )
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-
-    audio_path = MEDIA_DIR / f"{info['id']}.mp3"
-    if not audio_path.exists():
-        raise FileNotFoundError(f"Expected audio file missing: {audio_path}")
-    log.info("Downloaded audio for %s", url)
-    return audio_path
+    return media_path
 
 
-def transcribe_urdu(audio_path: Path) -> str:
-    """Transcribe the audio to Urdu text via Groq's Whisper large model."""
+def transcribe_urdu(media_path: Path) -> str:
+    """Transcribe the media's audio to Urdu text via Groq's Whisper large model.
+
+    Groq accepts mp4 directly, so the raw video file is uploaded as-is.
+    """
     client = Groq(api_key=GROQ_API_KEY)
-    with open(audio_path, "rb") as fh:
+    with open(media_path, "rb") as fh:
         result = client.audio.transcriptions.create(
-            file=(audio_path.name, fh.read()),
+            file=(media_path.name, fh.read()),
             model=GROQ_WHISPER_MODEL,
             language="ur",
             response_format="text",
@@ -345,39 +320,40 @@ def delete_media(audio_path: Path) -> None:
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def process_video(notion: NotionClient, username: str, url: str) -> bool:
-    audio_path: Path | None = None
+def process_video(notion: NotionClient, username: str, video: dict) -> bool:
+    url = video["url"]
+    media_path: Path | None = None
     try:
         if already_in_notion(notion, url):
             log.info("Skipping (already in Notion): %s", url)
             return True
 
-        audio_path = download_audio(url)
-        urdu_text = transcribe_urdu(audio_path)
+        media_path = download_video(video["video_url"], video["shortcode"])
+        urdu_text = transcribe_urdu(media_path)
         script = generate_roman_urdu_script(urdu_text, url)
         sync_to_notion(notion, username, url, script)
 
         # Delete ONLY after a successful Notion response — zero retention.
-        delete_media(audio_path)
+        delete_media(media_path)
         return True
     except Exception as exc:  # noqa: BLE001 — one bad video must not kill the run
         log.error("Failed to process %s (@%s): %s", url, username, exc)
         # Even on failure, never leave media behind on a shared runner.
-        if audio_path is not None:
-            delete_media(audio_path)
+        if media_path is not None:
+            delete_media(media_path)
         return False
 
 
 def process_creator(notion: NotionClient, username: str) -> tuple[int, int]:
     """Process a creator's latest videos. Returns (succeeded, failed)."""
     try:
-        urls = get_latest_video_urls(username)
+        videos = get_latest_videos(username)
     except Exception as exc:  # noqa: BLE001
         log.error("Failed to list videos for @%s: %s", username, exc)
         return 0, 1
 
-    ok = sum(process_video(notion, username, url) for url in urls)
-    return ok, len(urls) - ok
+    ok = sum(process_video(notion, username, video) for video in videos)
+    return ok, len(videos) - ok
 
 
 def validate_environment() -> bool:
@@ -408,22 +384,17 @@ def main() -> int:
         log.warning("No creators to process. Exiting.")
         return 0
 
-    write_cookies_file()
-    try:
-        notion = NotionClient(auth=NOTION_API_KEY)
-        total_ok = total_failed = 0
-        for username in creators:
-            ok, failed = process_creator(notion, username)
-            total_ok += ok
-            total_failed += failed
+    notion = NotionClient(auth=NOTION_API_KEY)
+    total_ok = total_failed = 0
+    for username in creators:
+        ok, failed = process_creator(notion, username)
+        total_ok += ok
+        total_failed += failed
 
-        log.info(
-            "=== Run finished: %d succeeded, %d failed ===", total_ok, total_failed
-        )
-        return 1 if total_failed else 0
-    finally:
-        # Sensitive cookies must never linger on the runner.
-        delete_cookies_file()
+    log.info(
+        "=== Run finished: %d succeeded, %d failed ===", total_ok, total_failed
+    )
+    return 1 if total_failed else 0
 
 
 if __name__ == "__main__":
