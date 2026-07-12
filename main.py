@@ -2,7 +2,7 @@
 Automated Instagram -> Notion content pipeline (profile monitoring).
 
 Flow (per creator in creators.txt):
-    1. instaloader lists the latest 3 videos on the creator's profile
+    1. Apify (instagram-scraper actor) lists the latest 3 videos on the profile
     2. Videos already present in Notion are skipped (duplicate check by URL)
     3. yt-dlp downloads each new video's audio into ./tmp_media
     4. Groq (Whisper large v3) transcribes the audio in Urdu
@@ -21,11 +21,11 @@ import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
+from apify_client import ApifyClient
 from dotenv import load_dotenv
 from google import genai
 from groq import Groq
 from notion_client import Client as NotionClient
-import instaloader
 import yt_dlp
 
 # ---------------------------------------------------------------------------
@@ -39,6 +39,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 IG_COOKIES = os.getenv("IG_COOKIES")
+APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN")
 
 BASE_DIR = Path(__file__).resolve().parent
 MEDIA_DIR = BASE_DIR / "tmp_media"
@@ -48,6 +49,7 @@ COOKIES_FILE = BASE_DIR / "cookies.txt"
 
 GROQ_WHISPER_MODEL = "whisper-large-v3"
 GEMINI_MODEL = "gemini-2.5-flash"
+APIFY_INSTAGRAM_ACTOR = "apify/instagram-scraper"
 
 LATEST_VIDEOS_PER_CREATOR = 3
 # Look at most this many recent posts per profile when hunting for videos
@@ -148,22 +150,6 @@ def write_cookies_file() -> bool:
     return True
 
 
-def extract_sessionid() -> str | None:
-    """Parse the Netscape-format IG_COOKIES string for the sessionid value."""
-    if not IG_COOKIES:
-        return None
-    for line in IG_COOKIES.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        # Netscape format: domain, flag, path, secure, expiry, name, value
-        parts = line.split("\t")
-        if len(parts) >= 7 and parts[5] == "sessionid":
-            return parts[6]
-    log.warning("No 'sessionid' cookie found in IG_COOKIES.")
-    return None
-
-
 def delete_cookies_file() -> None:
     """Remove cookies.txt so sensitive cookies never linger on the runner."""
     try:
@@ -200,31 +186,35 @@ def load_creators() -> list[str]:
 
 
 def get_latest_video_urls(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR) -> list[str]:
-    """List the latest `limit` video URLs from a creator's profile via instaloader.
+    """List the latest `limit` video URLs from a creator's profile via Apify.
 
-    yt-dlp's [instagram:user] extractor is broken, so profile listing uses
-    instaloader (authenticated with the sessionid from IG_COOKIES); yt-dlp is
-    still used to download the individual video URLs returned here.
+    GitHub Actions IPs are blocked by Instagram (403 even with cookies), so
+    profile listing runs through Apify's instagram-scraper actor, which uses
+    residential proxies. yt-dlp is still used to download the individual
+    video URLs returned here.
     """
-    L = instaloader.Instaloader(quiet=True)
-    sessionid = extract_sessionid()
-    if sessionid:
-        L.context._session.cookies.set(
-            "sessionid", sessionid, domain=".instagram.com"
-        )
-    else:
-        log.warning("Listing @%s without a session — may be rate-limited.", username)
-
-    profile = instaloader.Profile.from_username(L.context, username)
+    client = ApifyClient(APIFY_API_TOKEN)
+    run = client.actor(APIFY_INSTAGRAM_ACTOR).call(
+        run_input={
+            "directUrls": [f"https://www.instagram.com/{username}/"],
+            "resultsType": "posts",
+            "resultsLimit": MAX_POSTS_TO_SCAN,
+            "addParentData": False,
+        }
+    )
 
     urls: list[str] = []
-    for scanned, post in enumerate(profile.get_posts(), start=1):
-        if post.is_video:
-            urls.append(f"https://www.instagram.com/p/{post.shortcode}/")
+    for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+        # Actor marks post types as "Video" / "Image" / "Sidecar".
+        if item.get("type") != "Video":
+            continue
+        url = item.get("url")
+        if not url and item.get("shortCode"):
+            url = f"https://www.instagram.com/p/{item['shortCode']}/"
+        if url:
+            urls.append(url)
             if len(urls) >= limit:
                 break
-        if scanned >= MAX_POSTS_TO_SCAN:
-            break
 
     log.info("Found %d latest video(s) for @%s", len(urls), username)
     return urls
@@ -390,6 +380,7 @@ def validate_environment() -> bool:
             "GROQ_API_KEY": GROQ_API_KEY,
             "NOTION_DATABASE_ID": NOTION_DATABASE_ID,
             "NOTION_API_KEY": NOTION_API_KEY,
+            "APIFY_API_TOKEN": APIFY_API_TOKEN,
         }.items()
         if not value
     ]
