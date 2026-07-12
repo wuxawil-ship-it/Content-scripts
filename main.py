@@ -2,7 +2,7 @@
 Automated Instagram -> Notion content pipeline (profile monitoring).
 
 Flow (per creator in creators.txt):
-    1. yt-dlp lists the latest 3 videos on the creator's profile
+    1. instaloader lists the latest 3 videos on the creator's profile
     2. Videos already present in Notion are skipped (duplicate check by URL)
     3. yt-dlp downloads each new video's audio into ./tmp_media
     4. Groq (Whisper large v3) transcribes the audio in Urdu
@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from google import genai
 from groq import Groq
 from notion_client import Client as NotionClient
+import instaloader
 import yt_dlp
 
 # ---------------------------------------------------------------------------
@@ -49,6 +50,9 @@ GROQ_WHISPER_MODEL = "whisper-large-v3"
 GEMINI_MODEL = "gemini-2.5-flash"
 
 LATEST_VIDEOS_PER_CREATOR = 3
+# Look at most this many recent posts per profile when hunting for videos
+# (skips pinned images / carousels without iterating the whole feed).
+MAX_POSTS_TO_SCAN = 10
 
 # Notion caps a single rich_text element at 2000 characters.
 NOTION_TEXT_CHUNK = 2000
@@ -144,6 +148,22 @@ def write_cookies_file() -> bool:
     return True
 
 
+def extract_sessionid() -> str | None:
+    """Parse the Netscape-format IG_COOKIES string for the sessionid value."""
+    if not IG_COOKIES:
+        return None
+    for line in IG_COOKIES.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Netscape format: domain, flag, path, secure, expiry, name, value
+        parts = line.split("\t")
+        if len(parts) >= 7 and parts[5] == "sessionid":
+            return parts[6]
+    log.warning("No 'sessionid' cookie found in IG_COOKIES.")
+    return None
+
+
 def delete_cookies_file() -> None:
     """Remove cookies.txt so sensitive cookies never linger on the runner."""
     try:
@@ -180,33 +200,31 @@ def load_creators() -> list[str]:
 
 
 def get_latest_video_urls(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR) -> list[str]:
-    """List the latest `limit` video URLs from a creator's profile (no download)."""
-    profile_url = f"https://www.instagram.com/{username}/"
-    ydl_opts = _ydl_opts(
-        extract_flat="in_playlist",
-        playlistend=limit,
-        ignoreerrors=True,
-    )
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(profile_url, download=False)
+    """List the latest `limit` video URLs from a creator's profile via instaloader.
 
-    entries = []
-    for entry in (info or {}).get("entries") or []:
-        if entry is None:
-            continue
-        # Some profile extractions nest posts one level deeper (tabs).
-        if entry.get("entries"):
-            entries.extend(e for e in entry["entries"] if e)
-        else:
-            entries.append(entry)
+    yt-dlp's [instagram:user] extractor is broken, so profile listing uses
+    instaloader (authenticated with the sessionid from IG_COOKIES); yt-dlp is
+    still used to download the individual video URLs returned here.
+    """
+    L = instaloader.Instaloader(quiet=True)
+    sessionid = extract_sessionid()
+    if sessionid:
+        L.context._session.cookies.set(
+            "sessionid", sessionid, domain=".instagram.com"
+        )
+    else:
+        log.warning("Listing @%s without a session — may be rate-limited.", username)
 
-    urls = []
-    for entry in entries[:limit]:
-        url = entry.get("url") or entry.get("webpage_url")
-        if not url and entry.get("id"):
-            url = f"https://www.instagram.com/p/{entry['id']}/"
-        if url:
-            urls.append(url)
+    profile = instaloader.Profile.from_username(L.context, username)
+
+    urls: list[str] = []
+    for scanned, post in enumerate(profile.get_posts(), start=1):
+        if post.is_video:
+            urls.append(f"https://www.instagram.com/p/{post.shortcode}/")
+            if len(urls) >= limit:
+                break
+        if scanned >= MAX_POSTS_TO_SCAN:
+            break
 
     log.info("Found %d latest video(s) for @%s", len(urls), username)
     return urls
