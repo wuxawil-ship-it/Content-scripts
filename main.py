@@ -20,6 +20,7 @@ Secrets come exclusively from environment variables:
 
 import logging
 import os
+import re
 import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -43,9 +44,24 @@ def _env(name: str) -> str:
     return (os.getenv(name) or "").strip()
 
 
+def _clean_database_id(raw: str) -> str:
+    """Extract a bare Notion database ID from whatever was pasted.
+
+    Accepts a plain 32-hex ID, a hyphenated UUID, or a full Notion URL like
+    https://www.notion.so/Workspace/Name-<id>?v=<view>. Notion rejects
+    anything else with "Invalid request URL".
+    """
+    match = re.search(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+        r"|[0-9a-fA-F]{32}",
+        raw,
+    )
+    return match.group(0) if match else raw
+
+
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
 GROQ_API_KEY = _env("GROQ_API_KEY")
-NOTION_DATABASE_ID = _env("NOTION_DATABASE_ID")
+NOTION_DATABASE_ID = _clean_database_id(_env("NOTION_DATABASE_ID"))
 NOTION_API_KEY = _env("NOTION_API_KEY")
 APIFY_API_TOKEN = _env("APIFY_API_TOKEN")
 
@@ -377,6 +393,16 @@ def validate_environment() -> bool:
     ]
     if missing:
         log.error("Missing required environment variables: %s", ", ".join(missing))
+        return False
+
+    if not re.fullmatch(r"[0-9a-fA-F]{32}|[0-9a-fA-F-]{36}", NOTION_DATABASE_ID):
+        log.error(
+            "NOTION_DATABASE_ID does not look like a Notion database ID "
+            "(got %d chars starting with %r). Paste the 32-character ID from "
+            "the database URL: notion.so/<workspace>/<Name>-<ID>?v=...",
+            len(NOTION_DATABASE_ID),
+            NOTION_DATABASE_ID[:4],
+        )
         return False
     return True
 
