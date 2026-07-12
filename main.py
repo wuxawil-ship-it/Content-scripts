@@ -141,6 +141,16 @@ Urdu transcript:
 {urdu_text}
 """
 
+ABOUT_PROMPT = """In ONE short line of Roman Urdu (maximum 12 words), state what
+this video is about. Output only that single line — no quotes, no emojis, no
+hashtags, no trailing punctuation.
+
+Urdu transcript:
+{urdu_text}
+"""
+
+PAGE_ICON = "🟡"
+
 
 # ---------------------------------------------------------------------------
 # Logging: 1-day rotating history
@@ -228,7 +238,14 @@ def get_latest_videos(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR) -> 
         if not video_url:
             log.warning("No videoUrl in Apify result for %s — skipping.", url)
             continue
-        videos.append({"url": url, "video_url": video_url, "shortcode": shortcode})
+        videos.append(
+            {
+                "url": url,
+                "video_url": video_url,
+                "shortcode": shortcode,
+                "posted_at": item.get("timestamp"),  # ISO 8601 post time
+            }
+        )
         if len(videos) >= limit:
             break
 
@@ -310,11 +327,9 @@ def transcribe_urdu(media_path: Path) -> str:
     return text
 
 
-def generate_roman_urdu_script(urdu_text: str, video_url: str) -> str:
-    """Rewrite the Urdu transcript as a structured Roman Urdu script via Gemini."""
+def _gemini_generate(prompt: str) -> str:
+    """Run a Gemini prompt, falling through the model list on 404s."""
     client = genai.Client(api_key=GEMINI_API_KEY)
-    prompt = SCRIPT_PROMPT.format(video_url=video_url, urdu_text=urdu_text)
-
     last_error: Exception | None = None
     for model in GEMINI_MODELS:
         try:
@@ -326,13 +341,31 @@ def generate_roman_urdu_script(urdu_text: str, video_url: str) -> str:
                 last_error = exc
                 continue
             raise
-        script = (response.text or "").strip()
-        if not script:
-            raise ValueError("Gemini returned an empty script.")
-        log.info("Script generated with %r (%d chars)", model, len(script))
-        return script
+        text = (response.text or "").strip()
+        if not text:
+            raise ValueError("Gemini returned an empty response.")
+        return text
 
     raise RuntimeError("No available Gemini model found.") from last_error
+
+
+def generate_roman_urdu_script(urdu_text: str, video_url: str) -> str:
+    """Rewrite the Urdu transcript as a structured Roman Urdu script via Gemini."""
+    script = _gemini_generate(
+        SCRIPT_PROMPT.format(video_url=video_url, urdu_text=urdu_text)
+    )
+    log.info("Script generated (%d chars)", len(script))
+    return script
+
+
+def generate_about_line(urdu_text: str) -> str:
+    """One-line Roman Urdu summary for the About column. Optional — never fatal."""
+    try:
+        about = _gemini_generate(ABOUT_PROMPT.format(urdu_text=urdu_text))
+        return about.splitlines()[0].strip()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not generate About line: %s", exc)
+        return ""
 
 
 def _chunk_text(text: str, size: int = NOTION_TEXT_CHUNK) -> list[str]:
@@ -360,13 +393,13 @@ def notion_request(method: str, path: str, payload: dict | None = None) -> dict:
     return response.json()
 
 
-def prepare_database() -> str | None:
+def prepare_database() -> tuple[str, set[str]] | None:
     """Verify the Notion database is reachable and fit for the pipeline.
 
-    Returns the name of the database's title property (schemas differ — e.g.
-    "Name" vs "Creator"), and creates the "Instagram URL" url property if the
-    database doesn't have one yet. Returns None if the database can't be
-    accessed, logging Notion's exact error once instead of per-video.
+    Returns (title property name, set of all property names) — schemas differ,
+    and optional columns like About/Date are only filled if they exist.
+    Creates the "Instagram URL" url property if missing. Returns None if the
+    database can't be accessed, logging Notion's exact error once.
     """
     try:
         db = notion_request("GET", f"databases/{NOTION_DATABASE_ID}")
@@ -391,10 +424,11 @@ def prepare_database() -> str | None:
             f"databases/{NOTION_DATABASE_ID}",
             {"properties": {"Instagram URL": {"url": {}}}},
         )
+        props["Instagram URL"] = {"type": "url"}
         log.info('Added missing "Instagram URL" property to the database.')
 
     log.info("Notion database OK (title property: %r).", title_prop)
-    return title_prop
+    return title_prop, set(props)
 
 
 def already_in_notion(url: str) -> bool:
@@ -410,11 +444,20 @@ def already_in_notion(url: str) -> bool:
     return len(response.get("results", [])) > 0
 
 
-def sync_to_notion(title_prop: str, username: str, url: str, script: str) -> None:
+def sync_to_notion(
+    title_prop: str,
+    db_props: set[str],
+    username: str,
+    video: dict,
+    script: str,
+    about: str,
+) -> None:
     """Create the Notion page — the single source of truth for this pipeline.
 
     Title = creator username, URL property = video link, and the entire Gemini
-    response (link + 4-line hook + script body) becomes the page body.
+    response (link + 4-line hook + script body) becomes the page body. About
+    and Date columns are filled when the database has them; every page gets
+    the yellow-circle icon.
     """
     paragraphs = []
     for block in script.split("\n\n"):
@@ -432,19 +475,28 @@ def sync_to_notion(title_prop: str, username: str, url: str, script: str) -> Non
                 }
             )
 
+    properties = {
+        title_prop: {"title": [{"text": {"content": username}}]},
+        "Instagram URL": {"url": video["url"]},
+    }
+    if about and "About" in db_props:
+        properties["About"] = {
+            "rich_text": [{"type": "text", "text": {"content": about[:2000]}}]
+        }
+    if video.get("posted_at") and "Date" in db_props:
+        properties["Date"] = {"date": {"start": video["posted_at"]}}
+
     notion_request(
         "POST",
         "pages",
         {
             "parent": {"database_id": NOTION_DATABASE_ID},
-            "properties": {
-                title_prop: {"title": [{"text": {"content": username}}]},
-                "Instagram URL": {"url": url},
-            },
+            "icon": {"type": "emoji", "emoji": PAGE_ICON},
+            "properties": properties,
             "children": paragraphs,
         },
     )
-    log.info("Notion page created for %s (@%s)", url, username)
+    log.info("Notion page created for %s (@%s)", video["url"], username)
 
 
 def delete_media(audio_path: Path) -> None:
@@ -460,7 +512,9 @@ def delete_media(audio_path: Path) -> None:
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def process_video(title_prop: str, username: str, video: dict) -> bool:
+def process_video(
+    title_prop: str, db_props: set[str], username: str, video: dict
+) -> bool:
     url = video["url"]
     media_path: Path | None = None
     try:
@@ -472,7 +526,8 @@ def process_video(title_prop: str, username: str, video: dict) -> bool:
         media_path = extract_audio(media_path)
         urdu_text = transcribe_urdu(media_path)
         script = generate_roman_urdu_script(urdu_text, url)
-        sync_to_notion(title_prop, username, url, script)
+        about = generate_about_line(urdu_text)
+        sync_to_notion(title_prop, db_props, username, video, script, about)
 
         # Delete ONLY after a successful Notion response — zero retention.
         delete_media(media_path)
@@ -485,7 +540,9 @@ def process_video(title_prop: str, username: str, video: dict) -> bool:
         return False
 
 
-def process_creator(title_prop: str, username: str) -> tuple[int, int]:
+def process_creator(
+    title_prop: str, db_props: set[str], username: str
+) -> tuple[int, int]:
     """Process a creator's latest videos. Returns (succeeded, failed)."""
     try:
         videos = get_latest_videos(username)
@@ -493,7 +550,7 @@ def process_creator(title_prop: str, username: str) -> tuple[int, int]:
         log.error("Failed to list videos for @%s: %s", username, exc)
         return 0, 1
 
-    ok = sum(process_video(title_prop, username, video) for video in videos)
+    ok = sum(process_video(title_prop, db_props, username, video) for video in videos)
     return ok, len(videos) - ok
 
 
@@ -535,13 +592,14 @@ def main() -> int:
         log.warning("No creators to process. Exiting.")
         return 0
 
-    title_prop = prepare_database()
-    if title_prop is None:
+    db_info = prepare_database()
+    if db_info is None:
         return 1
+    title_prop, db_props = db_info
 
     total_ok = total_failed = 0
     for username in creators:
-        ok, failed = process_creator(title_prop, username)
+        ok, failed = process_creator(title_prop, db_props, username)
         total_ok += ok
         total_failed += failed
 
