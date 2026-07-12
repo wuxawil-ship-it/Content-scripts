@@ -200,8 +200,12 @@ def get_latest_video_urls(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR)
         }
     )
 
+    if run is None:
+        raise RuntimeError(f"Apify actor run failed for @{username}")
+
     urls: list[str] = []
-    for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+    # apify-client returns a Run object — access fields as attributes.
+    for item in client.dataset(run.default_dataset_id).iterate_items():
         # Actor marks post types as "Video" / "Image" / "Sidecar".
         if item.get("type") != "Video":
             continue
