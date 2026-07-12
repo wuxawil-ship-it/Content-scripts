@@ -21,6 +21,7 @@ Secrets come exclusively from environment variables:
 import logging
 import os
 import re
+import subprocess
 import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -70,7 +71,19 @@ LOG_DIR = BASE_DIR / "logs"
 CREATORS_FILE = BASE_DIR / "creators.txt"
 
 GROQ_WHISPER_MODEL = "whisper-large-v3"
-GEMINI_MODEL = "gemini-2.5-flash"
+# Tried in order; Google retires model names (gemini-2.5-flash 404s for new
+# users), so prefer the rolling "-latest" alias with dated fallbacks.
+# GEMINI_MODEL env var, if set, is tried first.
+GEMINI_MODELS = [
+    m
+    for m in (
+        os.getenv("GEMINI_MODEL", "").strip(),
+        "gemini-flash-latest",
+        "gemini-3-flash-preview",
+        "gemini-2.5-flash",
+    )
+    if m
+]
 APIFY_INSTAGRAM_ACTOR = "apify/instagram-scraper"
 
 # Notion is called directly over HTTP with an explicit URL and pinned API
@@ -245,6 +258,37 @@ def download_video(video_url: str, shortcode: str) -> Path:
     return media_path
 
 
+def extract_audio(video_path: Path) -> Path:
+    """Convert the video to a small mp3 so uploads stay under Groq's 25 MB cap.
+
+    Falls back to the original video if ffmpeg is unavailable or fails.
+    """
+    audio_path = video_path.with_suffix(".mp3")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(video_path),
+                "-vn", "-acodec", "libmp3lame", "-b:a", "96k",
+                str(audio_path),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ffmpeg audio extraction failed (%s) — uploading video as-is.", exc)
+        audio_path.unlink(missing_ok=True)
+        return video_path
+
+    video_path.unlink(missing_ok=True)
+    log.info(
+        "Extracted audio %s (%.1f MB)",
+        audio_path.name,
+        audio_path.stat().st_size / 1_048_576,
+    )
+    return audio_path
+
+
 def transcribe_urdu(media_path: Path) -> str:
     """Transcribe the media's audio to Urdu text via Groq's Whisper large model.
 
@@ -269,15 +313,26 @@ def transcribe_urdu(media_path: Path) -> str:
 def generate_roman_urdu_script(urdu_text: str, video_url: str) -> str:
     """Rewrite the Urdu transcript as a structured Roman Urdu script via Gemini."""
     client = genai.Client(api_key=GEMINI_API_KEY)
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=SCRIPT_PROMPT.format(video_url=video_url, urdu_text=urdu_text),
-    )
-    script = (response.text or "").strip()
-    if not script:
-        raise ValueError("Gemini returned an empty script.")
-    log.info("Script generated (%d chars)", len(script))
-    return script
+    prompt = SCRIPT_PROMPT.format(video_url=video_url, urdu_text=urdu_text)
+
+    last_error: Exception | None = None
+    for model in GEMINI_MODELS:
+        try:
+            response = client.models.generate_content(model=model, contents=prompt)
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            if "404" in message or "NOT_FOUND" in message:
+                log.warning("Gemini model %r unavailable — trying next.", model)
+                last_error = exc
+                continue
+            raise
+        script = (response.text or "").strip()
+        if not script:
+            raise ValueError("Gemini returned an empty script.")
+        log.info("Script generated with %r (%d chars)", model, len(script))
+        return script
+
+    raise RuntimeError("No available Gemini model found.") from last_error
 
 
 def _chunk_text(text: str, size: int = NOTION_TEXT_CHUNK) -> list[str]:
@@ -414,6 +469,7 @@ def process_video(title_prop: str, username: str, video: dict) -> bool:
             return True
 
         media_path = download_video(video["video_url"], video["shortcode"])
+        media_path = extract_audio(media_path)
         urdu_text = transcribe_urdu(media_path)
         script = generate_roman_urdu_script(urdu_text, url)
         sync_to_notion(title_prop, username, url, script)
