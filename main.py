@@ -52,9 +52,6 @@ GEMINI_MODEL = "gemini-2.5-flash"
 APIFY_INSTAGRAM_ACTOR = "apify/instagram-scraper"
 
 LATEST_VIDEOS_PER_CREATOR = 3
-# Look at most this many recent posts per profile when hunting for videos
-# (skips pinned images / carousels without iterating the whole feed).
-MAX_POSTS_TO_SCAN = 10
 
 # Notion caps a single rich_text element at 2000 characters.
 NOTION_TEXT_CHUNK = 2000
@@ -198,7 +195,7 @@ def get_latest_video_urls(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR)
         run_input={
             "directUrls": [f"https://www.instagram.com/{username}/"],
             "resultsType": "posts",
-            "resultsLimit": MAX_POSTS_TO_SCAN,
+            "resultsLimit": limit,  # only the absolute latest posts — conserves Apify credits
             "addParentData": False,
         }
     )
