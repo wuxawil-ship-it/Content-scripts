@@ -436,8 +436,7 @@ def fetch_topic_images(search_query: str) -> list[str]:
         run = client.actor(APIFY_IMAGE_ACTOR).call(
             run_input={
                 "queries": search_query,
-                "resultsPerPage": 10,
-                "maxPagesPerQuery": 1,
+                "limit": 10,
             },
             logger=None,
         )

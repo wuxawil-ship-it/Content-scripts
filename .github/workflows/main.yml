@@ -32,4 +32,5 @@ jobs:
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+          APIFY_IMAGE_ACTOR: ${{ secrets.APIFY_IMAGE_ACTOR }}
         run: python main.py
