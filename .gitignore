@@ -1,5 +1,6 @@
 # Secrets — never commit
 .env
+cookies.txt
 
 # Zero-retention media and logs
 tmp_media/

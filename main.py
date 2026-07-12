@@ -37,11 +37,13 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
+IG_COOKIES = os.getenv("IG_COOKIES")
 
 BASE_DIR = Path(__file__).resolve().parent
 MEDIA_DIR = BASE_DIR / "tmp_media"
 LOG_DIR = BASE_DIR / "logs"
 CREATORS_FILE = BASE_DIR / "creators.txt"
+COOKIES_FILE = BASE_DIR / "cookies.txt"
 
 GROQ_WHISPER_MODEL = "whisper-large-v3"
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -126,6 +128,40 @@ log = setup_logging()
 
 
 # ---------------------------------------------------------------------------
+# Instagram authentication cookies
+# ---------------------------------------------------------------------------
+
+def write_cookies_file() -> bool:
+    """Write the IG_COOKIES secret to cookies.txt for yt-dlp authentication."""
+    if not IG_COOKIES:
+        log.warning(
+            "IG_COOKIES is not set — yt-dlp will run unauthenticated and may "
+            "hit 429 errors."
+        )
+        return False
+    COOKIES_FILE.write_text(IG_COOKIES, encoding="utf-8")
+    log.info("Wrote Instagram cookies to %s", COOKIES_FILE.name)
+    return True
+
+
+def delete_cookies_file() -> None:
+    """Remove cookies.txt so sensitive cookies never linger on the runner."""
+    try:
+        COOKIES_FILE.unlink(missing_ok=True)
+        log.info("Deleted cookies file.")
+    except OSError as exc:
+        log.error("Failed to delete cookies file: %s", exc)
+
+
+def _ydl_opts(**extra) -> dict:
+    """Base yt-dlp options, including the cookie file when available."""
+    opts = {"quiet": True, **extra}
+    if COOKIES_FILE.exists():
+        opts["cookiefile"] = str(COOKIES_FILE)
+    return opts
+
+
+# ---------------------------------------------------------------------------
 # Pipeline steps
 # ---------------------------------------------------------------------------
 
@@ -146,12 +182,11 @@ def load_creators() -> list[str]:
 def get_latest_video_urls(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR) -> list[str]:
     """List the latest `limit` video URLs from a creator's profile (no download)."""
     profile_url = f"https://www.instagram.com/{username}/"
-    ydl_opts = {
-        "extract_flat": "in_playlist",
-        "playlistend": limit,
-        "quiet": True,
-        "ignoreerrors": True,
-    }
+    ydl_opts = _ydl_opts(
+        extract_flat="in_playlist",
+        playlistend=limit,
+        ignoreerrors=True,
+    )
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(profile_url, download=False)
 
@@ -180,19 +215,18 @@ def get_latest_video_urls(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR)
 def download_audio(url: str) -> Path:
     """Download the video's audio into tmp_media. Returns the file path."""
     MEDIA_DIR.mkdir(exist_ok=True)
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": str(MEDIA_DIR / "%(id)s.%(ext)s"),
-        "postprocessors": [
+    ydl_opts = _ydl_opts(
+        format="bestaudio/best",
+        outtmpl=str(MEDIA_DIR / "%(id)s.%(ext)s"),
+        postprocessors=[
             {
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
                 "preferredquality": "128",
             }
         ],
-        "quiet": True,
-        "noplaylist": True,
-    }
+        noplaylist=True,
+    )
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
 
@@ -357,17 +391,22 @@ def main() -> int:
         log.warning("No creators to process. Exiting.")
         return 0
 
-    notion = NotionClient(auth=NOTION_API_KEY)
-    total_ok = total_failed = 0
-    for username in creators:
-        ok, failed = process_creator(notion, username)
-        total_ok += ok
-        total_failed += failed
+    write_cookies_file()
+    try:
+        notion = NotionClient(auth=NOTION_API_KEY)
+        total_ok = total_failed = 0
+        for username in creators:
+            ok, failed = process_creator(notion, username)
+            total_ok += ok
+            total_failed += failed
 
-    log.info(
-        "=== Run finished: %d succeeded, %d failed ===", total_ok, total_failed
-    )
-    return 1 if total_failed else 0
+        log.info(
+            "=== Run finished: %d succeeded, %d failed ===", total_ok, total_failed
+        )
+        return 1 if total_failed else 0
+    finally:
+        # Sensitive cookies must never linger on the runner.
+        delete_cookies_file()
 
 
 if __name__ == "__main__":
