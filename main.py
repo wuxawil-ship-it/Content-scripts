@@ -280,6 +280,42 @@ def _chunk_text(text: str, size: int = NOTION_TEXT_CHUNK) -> list[str]:
     return [text[i : i + size] for i in range(0, len(text), size)]
 
 
+def prepare_database(notion: NotionClient) -> str | None:
+    """Verify the Notion database is reachable and fit for the pipeline.
+
+    Returns the name of the database's title property (schemas differ — e.g.
+    "Name" vs "Creator"), and creates the "Instagram URL" url property if the
+    database doesn't have one yet. Returns None if the database can't be
+    accessed, logging Notion's exact error once instead of per-video.
+    """
+    try:
+        db = notion.databases.retrieve(database_id=NOTION_DATABASE_ID)
+    except Exception as exc:  # noqa: BLE001
+        log.error(
+            "Cannot access Notion database (ID starts %r): %s — check that "
+            "NOTION_DATABASE_ID is the database ID and the integration is "
+            "connected to it (database ... menu -> Connections).",
+            NOTION_DATABASE_ID[:8],
+            exc,
+        )
+        return None
+
+    props = db.get("properties", {})
+    title_prop = next(
+        (name for name, p in props.items() if p.get("type") == "title"), "Name"
+    )
+
+    if "Instagram URL" not in props:
+        notion.databases.update(
+            database_id=NOTION_DATABASE_ID,
+            properties={"Instagram URL": {"url": {}}},
+        )
+        log.info('Added missing "Instagram URL" property to the database.')
+
+    log.info("Notion database OK (title property: %r).", title_prop)
+    return title_prop
+
+
 def already_in_notion(notion: NotionClient, url: str) -> bool:
     """Skip videos that already have a page (keeps scheduled runs idempotent).
 
@@ -297,7 +333,9 @@ def already_in_notion(notion: NotionClient, url: str) -> bool:
     return len(response.get("results", [])) > 0
 
 
-def sync_to_notion(notion: NotionClient, username: str, url: str, script: str) -> None:
+def sync_to_notion(
+    notion: NotionClient, title_prop: str, username: str, url: str, script: str
+) -> None:
     """Create the Notion page — the single source of truth for this pipeline.
 
     Title = creator username, URL property = video link, and the entire Gemini
@@ -322,7 +360,7 @@ def sync_to_notion(notion: NotionClient, username: str, url: str, script: str) -
     notion.pages.create(
         parent={"database_id": NOTION_DATABASE_ID},
         properties={
-            "Creator": {"title": [{"text": {"content": username}}]},
+            title_prop: {"title": [{"text": {"content": username}}]},
             "Instagram URL": {"url": url},
         },
         children=paragraphs,
@@ -343,7 +381,9 @@ def delete_media(audio_path: Path) -> None:
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def process_video(notion: NotionClient, username: str, video: dict) -> bool:
+def process_video(
+    notion: NotionClient, title_prop: str, username: str, video: dict
+) -> bool:
     url = video["url"]
     media_path: Path | None = None
     try:
@@ -354,7 +394,7 @@ def process_video(notion: NotionClient, username: str, video: dict) -> bool:
         media_path = download_video(video["video_url"], video["shortcode"])
         urdu_text = transcribe_urdu(media_path)
         script = generate_roman_urdu_script(urdu_text, url)
-        sync_to_notion(notion, username, url, script)
+        sync_to_notion(notion, title_prop, username, url, script)
 
         # Delete ONLY after a successful Notion response — zero retention.
         delete_media(media_path)
@@ -367,7 +407,9 @@ def process_video(notion: NotionClient, username: str, video: dict) -> bool:
         return False
 
 
-def process_creator(notion: NotionClient, username: str) -> tuple[int, int]:
+def process_creator(
+    notion: NotionClient, title_prop: str, username: str
+) -> tuple[int, int]:
     """Process a creator's latest videos. Returns (succeeded, failed)."""
     try:
         videos = get_latest_videos(username)
@@ -375,7 +417,7 @@ def process_creator(notion: NotionClient, username: str) -> tuple[int, int]:
         log.error("Failed to list videos for @%s: %s", username, exc)
         return 0, 1
 
-    ok = sum(process_video(notion, username, video) for video in videos)
+    ok = sum(process_video(notion, title_prop, username, video) for video in videos)
     return ok, len(videos) - ok
 
 
@@ -418,9 +460,13 @@ def main() -> int:
         return 0
 
     notion = NotionClient(auth=NOTION_API_KEY)
+    title_prop = prepare_database(notion)
+    if title_prop is None:
+        return 1
+
     total_ok = total_failed = 0
     for username in creators:
-        ok, failed = process_creator(notion, username)
+        ok, failed = process_creator(notion, title_prop, username)
         total_ok += ok
         total_failed += failed
 
