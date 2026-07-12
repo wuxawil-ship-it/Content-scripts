@@ -1,4 +1,0 @@
-# Predefined list of Instagram Reel URLs — one per line.
-# Lines starting with # are ignored.
-# Example:
-# https://www.instagram.com/reel/XXXXXXXXXXX/

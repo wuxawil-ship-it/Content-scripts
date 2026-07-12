@@ -1,0 +1,10 @@
+# Instagram usernames to monitor — one per line, without the @ symbol.
+# Lines starting with # are ignored.
+crypto_kanishk
+thecatvoice
+bitinning
+dylanpage.ning
+jacktardessss
+bora.printss
+ancestral.trader
+kashifoncrypto

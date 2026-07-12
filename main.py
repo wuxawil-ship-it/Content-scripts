@@ -1,12 +1,15 @@
 """
-Automated Instagram -> Notion content pipeline.
+Automated Instagram -> Notion content pipeline (profile monitoring).
 
-Flow (per reel URL):
-    1. yt-dlp downloads audio into ./tmp_media
-    2. Groq (Whisper large v3) transcribes the audio in Urdu
-    3. Gemini transliterates the Urdu into strictly formatted Roman Urdu
-    4. Notion page is created (Creator, URL, Roman Urdu transcript)
-    5. Media file is permanently deleted (zero retention)
+Flow (per creator in creators.txt):
+    1. yt-dlp lists the latest 3 videos on the creator's profile
+    2. Videos already present in Notion are skipped (duplicate check by URL)
+    3. yt-dlp downloads each new video's audio into ./tmp_media
+    4. Groq (Whisper large v3) transcribes the audio in Urdu
+    5. Gemini rewrites it as a condensed Roman Urdu script
+       (link on top + 4-line hook + script body)
+    6. Notion page is created (Creator username, video URL, full script)
+    7. Media file is permanently deleted (zero retention)
 
 Secrets come exclusively from environment variables:
     GEMINI_API_KEY, GROQ_API_KEY, NOTION_DATABASE_ID, NOTION_API_KEY
@@ -38,29 +41,55 @@ NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 BASE_DIR = Path(__file__).resolve().parent
 MEDIA_DIR = BASE_DIR / "tmp_media"
 LOG_DIR = BASE_DIR / "logs"
-REELS_FILE = BASE_DIR / "reels.txt"
+CREATORS_FILE = BASE_DIR / "creators.txt"
 
 GROQ_WHISPER_MODEL = "whisper-large-v3"
 GEMINI_MODEL = "gemini-2.5-flash"
 
+LATEST_VIDEOS_PER_CREATOR = 3
+
 # Notion caps a single rich_text element at 2000 characters.
 NOTION_TEXT_CHUNK = 2000
 
-TRANSLITERATION_PROMPT = """You are an expert Urdu-to-Roman-Urdu transliterator.
+SCRIPT_PROMPT = """You are an expert scriptwriter who converts raw Urdu transcripts into polished, ready-to-read Roman Urdu scripts.
 
-Convert the following Urdu text into Roman Urdu. Follow EVERY rule below strictly:
+Video link: {video_url}
 
-1. Output ONLY the Roman Urdu text. No timestamps, no parentheses, no brackets,
-   no headings, no explanations, no notes of any kind.
-2. Break the text into short paragraphs: add a newline after each sentence and a
-   blank line between paragraphs so the result is easy to read.
-3. Always use informal second-person pronouns: 'tum', 'tumharay', 'tumhay',
-   'tumhari', 'tumhara'.
-4. NEVER use formal pronouns or their derivatives: 'aap', 'apkay', 'apki',
-   'apka' are strictly forbidden. Rewrite any formal address into the informal
-   'tum' form, adjusting verbs to match (e.g. 'aap karein' -> 'tum karo').
+Rewrite the transcript below into a final script, following EVERY rule strictly:
 
-Urdu text:
+FORMAT STRUCTURE — the output must be exactly three parts, in this order:
+1. The original IG video link ({video_url}) alone at the very top.
+2. A brief, catchy 4-line introductory hook summarizing the core value of the video.
+3. The main script body.
+Output ONLY these three parts — no headings, no labels, no explanations, no notes.
+
+LANGUAGE & TONE:
+- Write exclusively in Roman Urdu. Do NOT mix in Hindi words.
+- Maintain a friendly yet authoritative tone.
+
+VOCABULARY RULES:
+- Strictly use informal pronouns: 'tum', 'tumharay', 'tumhay', 'tumhari', 'tumhara'.
+- The formal pronouns 'aap', 'apkay', 'apki', 'apka' are absolutely FORBIDDEN.
+  Rewrite any formal address into the informal 'tum' form, adjusting verbs to
+  match (e.g. 'aap karein' -> 'tum karo').
+
+CONTENT CONSTRAINTS:
+- Remove standard regional filler phrases and generic terms; replace them with
+  high-conversion alternative hooks.
+- Edit and condense the raw transcript so the final script takes a maximum of
+  1 to 2 minutes to read aloud (approximately 150-250 words). Do NOT exceed
+  this limit.
+
+FORMATTING RESTRICTIONS:
+- No timestamps. No parentheses.
+- Ensure clear readability: add a newline after every sentence and a blank
+  line between paragraphs.
+
+END CONSTRAINT:
+- Completely exclude any automated captions, emojis, or hashtags from the end
+  of the script.
+
+Urdu transcript:
 {urdu_text}
 """
 
@@ -100,22 +129,56 @@ log = setup_logging()
 # Pipeline steps
 # ---------------------------------------------------------------------------
 
-def load_reel_urls() -> list[str]:
-    """Read the predefined list of Instagram Reel URLs from reels.txt."""
-    if not REELS_FILE.exists():
-        log.error("reels.txt not found — nothing to process.")
+def load_creators() -> list[str]:
+    """Read the list of Instagram usernames from creators.txt."""
+    if not CREATORS_FILE.exists():
+        log.error("creators.txt not found — nothing to process.")
         return []
-    urls = [
-        line.strip()
-        for line in REELS_FILE.read_text(encoding="utf-8").splitlines()
+    creators = [
+        line.strip().lstrip("@")
+        for line in CREATORS_FILE.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    log.info("Loaded %d reel URL(s) from reels.txt", len(urls))
+    log.info("Loaded %d creator(s) from creators.txt", len(creators))
+    return creators
+
+
+def get_latest_video_urls(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR) -> list[str]:
+    """List the latest `limit` video URLs from a creator's profile (no download)."""
+    profile_url = f"https://www.instagram.com/{username}/"
+    ydl_opts = {
+        "extract_flat": "in_playlist",
+        "playlistend": limit,
+        "quiet": True,
+        "ignoreerrors": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(profile_url, download=False)
+
+    entries = []
+    for entry in (info or {}).get("entries") or []:
+        if entry is None:
+            continue
+        # Some profile extractions nest posts one level deeper (tabs).
+        if entry.get("entries"):
+            entries.extend(e for e in entry["entries"] if e)
+        else:
+            entries.append(entry)
+
+    urls = []
+    for entry in entries[:limit]:
+        url = entry.get("url") or entry.get("webpage_url")
+        if not url and entry.get("id"):
+            url = f"https://www.instagram.com/p/{entry['id']}/"
+        if url:
+            urls.append(url)
+
+    log.info("Found %d latest video(s) for @%s", len(urls), username)
     return urls
 
 
-def download_audio(url: str) -> tuple[Path, str]:
-    """Download the reel's audio into tmp_media. Returns (file_path, creator)."""
+def download_audio(url: str) -> Path:
+    """Download the video's audio into tmp_media. Returns the file path."""
     MEDIA_DIR.mkdir(exist_ok=True)
     ydl_opts = {
         "format": "bestaudio/best",
@@ -133,17 +196,11 @@ def download_audio(url: str) -> tuple[Path, str]:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
 
-    creator = (
-        info.get("uploader")
-        or info.get("channel")
-        or info.get("uploader_id")
-        or "Unknown Creator"
-    )
     audio_path = MEDIA_DIR / f"{info['id']}.mp3"
     if not audio_path.exists():
         raise FileNotFoundError(f"Expected audio file missing: {audio_path}")
-    log.info("Downloaded audio for %s (creator: %s)", url, creator)
-    return audio_path, creator
+    log.info("Downloaded audio for %s", url)
+    return audio_path
 
 
 def transcribe_urdu(audio_path: Path) -> str:
@@ -164,18 +221,18 @@ def transcribe_urdu(audio_path: Path) -> str:
     return text
 
 
-def transliterate_to_roman_urdu(urdu_text: str) -> str:
-    """Convert Urdu text to strictly formatted Roman Urdu via Gemini."""
+def generate_roman_urdu_script(urdu_text: str, video_url: str) -> str:
+    """Rewrite the Urdu transcript as a structured Roman Urdu script via Gemini."""
     client = genai.Client(api_key=GEMINI_API_KEY)
     response = client.models.generate_content(
         model=GEMINI_MODEL,
-        contents=TRANSLITERATION_PROMPT.format(urdu_text=urdu_text),
+        contents=SCRIPT_PROMPT.format(video_url=video_url, urdu_text=urdu_text),
     )
-    roman = (response.text or "").strip()
-    if not roman:
-        raise ValueError("Gemini returned an empty transliteration.")
-    log.info("Transliteration complete (%d chars)", len(roman))
-    return roman
+    script = (response.text or "").strip()
+    if not script:
+        raise ValueError("Gemini returned an empty script.")
+    log.info("Script generated (%d chars)", len(script))
+    return script
 
 
 def _chunk_text(text: str, size: int = NOTION_TEXT_CHUNK) -> list[str]:
@@ -183,7 +240,7 @@ def _chunk_text(text: str, size: int = NOTION_TEXT_CHUNK) -> list[str]:
 
 
 def already_in_notion(notion: NotionClient, url: str) -> bool:
-    """Skip reels that already have a page (keeps scheduled runs idempotent)."""
+    """Skip videos that already have a page (keeps scheduled runs idempotent)."""
     result = notion.databases.query(
         database_id=NOTION_DATABASE_ID,
         filter={"property": "Instagram URL", "url": {"equals": url}},
@@ -192,12 +249,14 @@ def already_in_notion(notion: NotionClient, url: str) -> bool:
     return len(result.get("results", [])) > 0
 
 
-def sync_to_notion(creator: str, url: str, roman_transcript: str) -> None:
-    """Create the Notion page — the single source of truth for this pipeline."""
-    notion = NotionClient(auth=NOTION_API_KEY)
+def sync_to_notion(notion: NotionClient, username: str, url: str, script: str) -> None:
+    """Create the Notion page — the single source of truth for this pipeline.
 
+    Title = creator username, URL property = video link, and the entire Gemini
+    response (link + 4-line hook + script body) becomes the page body.
+    """
     paragraphs = []
-    for block in roman_transcript.split("\n\n"):
+    for block in script.split("\n\n"):
         block = block.strip()
         if not block:
             continue
@@ -215,12 +274,12 @@ def sync_to_notion(creator: str, url: str, roman_transcript: str) -> None:
     notion.pages.create(
         parent={"database_id": NOTION_DATABASE_ID},
         properties={
-            "Creator": {"title": [{"text": {"content": creator}}]},
+            "Creator": {"title": [{"text": {"content": username}}]},
             "Instagram URL": {"url": url},
         },
         children=paragraphs,
     )
-    log.info("Notion page created for %s", url)
+    log.info("Notion page created for %s (@%s)", url, username)
 
 
 def delete_media(audio_path: Path) -> None:
@@ -236,27 +295,39 @@ def delete_media(audio_path: Path) -> None:
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def process_reel(url: str, notion: NotionClient) -> bool:
+def process_video(notion: NotionClient, username: str, url: str) -> bool:
     audio_path: Path | None = None
     try:
         if already_in_notion(notion, url):
             log.info("Skipping (already in Notion): %s", url)
             return True
 
-        audio_path, creator = download_audio(url)
+        audio_path = download_audio(url)
         urdu_text = transcribe_urdu(audio_path)
-        roman_text = transliterate_to_roman_urdu(urdu_text)
-        sync_to_notion(creator, url, roman_text)
+        script = generate_roman_urdu_script(urdu_text, url)
+        sync_to_notion(notion, username, url, script)
 
         # Delete ONLY after a successful Notion response — zero retention.
         delete_media(audio_path)
         return True
-    except Exception as exc:  # noqa: BLE001 — one bad reel must not kill the run
-        log.error("Failed to process %s: %s", url, exc)
+    except Exception as exc:  # noqa: BLE001 — one bad video must not kill the run
+        log.error("Failed to process %s (@%s): %s", url, username, exc)
         # Even on failure, never leave media behind on a shared runner.
         if audio_path is not None:
             delete_media(audio_path)
         return False
+
+
+def process_creator(notion: NotionClient, username: str) -> tuple[int, int]:
+    """Process a creator's latest videos. Returns (succeeded, failed)."""
+    try:
+        urls = get_latest_video_urls(username)
+    except Exception as exc:  # noqa: BLE001
+        log.error("Failed to list videos for @%s: %s", username, exc)
+        return 0, 1
+
+    ok = sum(process_video(notion, username, url) for url in urls)
+    return ok, len(urls) - ok
 
 
 def validate_environment() -> bool:
@@ -281,16 +352,22 @@ def main() -> int:
     if not validate_environment():
         return 1
 
-    urls = load_reel_urls()
-    if not urls:
-        log.warning("No reel URLs to process. Exiting.")
+    creators = load_creators()
+    if not creators:
+        log.warning("No creators to process. Exiting.")
         return 0
 
     notion = NotionClient(auth=NOTION_API_KEY)
-    ok = sum(process_reel(url, notion) for url in urls)
-    failed = len(urls) - ok
-    log.info("=== Run finished: %d succeeded, %d failed ===", ok, failed)
-    return 1 if failed else 0
+    total_ok = total_failed = 0
+    for username in creators:
+        ok, failed = process_creator(notion, username)
+        total_ok += ok
+        total_failed += failed
+
+    log.info(
+        "=== Run finished: %d succeeded, %d failed ===", total_ok, total_failed
+    )
+    return 1 if total_failed else 0
 
 
 if __name__ == "__main__":

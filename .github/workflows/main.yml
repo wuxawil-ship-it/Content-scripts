@@ -2,7 +2,7 @@ name: IG to Notion Pipeline
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours (UTC)
+    - cron: "0 */4 * * *"   # every 4 hours (UTC)
   workflow_dispatch:          # allow manual runs from the Actions tab
 
 jobs:
