@@ -37,11 +37,17 @@ from notion_client import Client as NotionClient
 
 load_dotenv()  # no-op on GitHub Actions; enables local .env testing
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
-NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN")
+def _env(name: str) -> str:
+    """Read an env var, stripping stray whitespace/newlines that break URLs
+    and auth headers (e.g. a trailing newline pasted into a GitHub secret)."""
+    return (os.getenv(name) or "").strip()
+
+
+GEMINI_API_KEY = _env("GEMINI_API_KEY")
+GROQ_API_KEY = _env("GROQ_API_KEY")
+NOTION_DATABASE_ID = _env("NOTION_DATABASE_ID")
+NOTION_API_KEY = _env("NOTION_API_KEY")
+APIFY_API_TOKEN = _env("APIFY_API_TOKEN")
 
 BASE_DIR = Path(__file__).resolve().parent
 MEDIA_DIR = BASE_DIR / "tmp_media"
