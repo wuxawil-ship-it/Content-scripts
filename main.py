@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
@@ -91,6 +92,10 @@ APIFY_IMAGE_ACTOR = os.getenv(
     "APIFY_IMAGE_ACTOR", "hooli/google-images-scraper"
 ).strip()
 MAX_TOPIC_IMAGES = 3
+
+# Below this many transcript characters the video has no usable speech
+# (music-only reels etc.) — skip it instead of failing.
+MIN_TRANSCRIPT_CHARS = 40
 
 # Notion is called directly over HTTP with an explicit URL and pinned API
 # version — SDK versions kept changing endpoint paths/behavior under us.
@@ -341,25 +346,46 @@ def transcribe_urdu(media_path: Path) -> str:
 
 
 def _gemini_generate(prompt: str) -> str:
-    """Run a Gemini prompt, falling through the model list on 404s."""
+    """Run a Gemini prompt with resilience.
+
+    Falls through the model list on 404 (retired model). Retries with backoff
+    on 503/429 (overload) before moving to the next model, since a different
+    model often has spare capacity when one is saturated.
+    """
     client = genai.Client(api_key=GEMINI_API_KEY)
     last_error: Exception | None = None
     for model in GEMINI_MODELS:
-        try:
-            response = client.models.generate_content(model=model, contents=prompt)
-        except Exception as exc:  # noqa: BLE001
-            message = str(exc)
-            if "404" in message or "NOT_FOUND" in message:
-                log.warning("Gemini model %r unavailable — trying next.", model)
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model, contents=prompt
+                )
+            except Exception as exc:  # noqa: BLE001
+                message = str(exc)
                 last_error = exc
-                continue
-            raise
-        text = (response.text or "").strip()
-        if not text:
-            raise ValueError("Gemini returned an empty response.")
-        return text
+                if "404" in message or "NOT_FOUND" in message:
+                    log.warning("Gemini model %r unavailable — trying next.", model)
+                    break  # next model
+                if any(
+                    marker in message
+                    for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")
+                ):
+                    wait = 10 * (attempt + 1)
+                    log.warning(
+                        "Gemini %r overloaded (attempt %d/3) — waiting %ds.",
+                        model,
+                        attempt + 1,
+                        wait,
+                    )
+                    time.sleep(wait)
+                    continue  # retry same model
+                raise
+            text = (response.text or "").strip()
+            if not text:
+                raise ValueError("Gemini returned an empty response.")
+            return text
 
-    raise RuntimeError("No available Gemini model found.") from last_error
+    raise RuntimeError("All Gemini models failed.") from last_error
 
 
 def generate_roman_urdu_script(urdu_text: str, video_url: str) -> tuple[str, str]:
@@ -637,6 +663,15 @@ def process_video(
         media_path = download_video(video["video_url"], video["shortcode"])
         media_path = extract_audio(media_path)
         urdu_text = transcribe_urdu(media_path)
+        if len(urdu_text) < MIN_TRANSCRIPT_CHARS:
+            log.warning(
+                "Transcript only %d chars for %s — no usable speech, skipping.",
+                len(urdu_text),
+                url,
+            )
+            delete_media(media_path)
+            return True
+
         script, search_query = generate_roman_urdu_script(urdu_text, url)
         about = generate_about_line(urdu_text)
         images = fetch_topic_images(search_query)
@@ -646,10 +681,12 @@ def process_video(
         delete_media(media_path)
         return True
     except Exception as exc:  # noqa: BLE001 — one bad video must not kill the run
-        log.error("Failed to process %s (@%s): %s", url, username, exc)
-        # Even on failure, never leave media behind on a shared runner.
         if media_path is not None:
             delete_media(media_path)
+        if "no audio track" in str(exc).lower():
+            log.warning("No audio track in %s (@%s) — skipping.", url, username)
+            return True
+        log.error("Failed to process %s (@%s): %s", url, username, exc)
         return False
 
 
