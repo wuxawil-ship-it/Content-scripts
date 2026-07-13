@@ -85,9 +85,11 @@ GEMINI_MODELS = [
     if m
 ]
 APIFY_INSTAGRAM_ACTOR = "apify/instagram-scraper"
-# Actor used to find topic images; override with APIFY_IMAGE_ACTOR env var
-# (e.g. a Google Images or Twitter scraper actor).
-APIFY_IMAGE_ACTOR = os.getenv("APIFY_IMAGE_ACTOR", "apify/google-search-scraper").strip()
+# Actor used to find topic images; override with APIFY_IMAGE_ACTOR env var.
+# Default is Google Images scraper (input: queries[] + maxResultsPerQuery).
+APIFY_IMAGE_ACTOR = os.getenv(
+    "APIFY_IMAGE_ACTOR", "hooli/google-images-scraper"
+).strip()
 MAX_TOPIC_IMAGES = 3
 
 # Notion is called directly over HTTP with an explicit URL and pinned API
@@ -435,8 +437,8 @@ def fetch_topic_images(search_query: str) -> list[str]:
         client = ApifyClient(APIFY_API_TOKEN)
         run = client.actor(APIFY_IMAGE_ACTOR).call(
             run_input={
-                "queries": search_query,
-                "limit": 10,
+                "queries": [search_query],
+                "maxResultsPerQuery": 10,
             },
             logger=None,
         )
