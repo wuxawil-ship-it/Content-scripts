@@ -88,9 +88,8 @@ GEMINI_MODELS = [
 APIFY_INSTAGRAM_ACTOR = "apify/instagram-scraper"
 # Actor used to find topic images; override with APIFY_IMAGE_ACTOR env var.
 # Default is Google Images scraper (input: queries[] + maxResultsPerQuery).
-APIFY_IMAGE_ACTOR = os.getenv(
-    "APIFY_IMAGE_ACTOR", "hooli/google-images-scraper"
-).strip()
+DEFAULT_IMAGE_ACTOR = "hooli/google-images-scraper"
+APIFY_IMAGE_ACTOR = os.getenv("APIFY_IMAGE_ACTOR", "").strip() or DEFAULT_IMAGE_ACTOR
 MAX_TOPIC_IMAGES = 3
 
 # Below this many transcript characters the video has no usable speech
@@ -416,13 +415,21 @@ def generate_roman_urdu_script(urdu_text: str, video_url: str) -> tuple[str, str
     return script, search_query
 
 
-def generate_about_line(urdu_text: str) -> str:
-    """One-line Roman Urdu summary for the About column. Optional — never fatal."""
+def generate_about_line(urdu_text: str, script: str) -> str:
+    """One-line Roman Urdu summary for the About column. Optional — never fatal.
+
+    Falls back to the script's first hook line if Gemini is unavailable
+    (e.g. still overloaded right after the script call).
+    """
     try:
         about = _gemini_generate(ABOUT_PROMPT.format(urdu_text=urdu_text))
         return about.splitlines()[0].strip()
     except Exception as exc:  # noqa: BLE001
-        log.warning("Could not generate About line: %s", exc)
+        log.warning("Could not generate About line (%s) — using hook line.", exc)
+        for line in script.splitlines():
+            line = line.strip()
+            if line and not line.lower().startswith("http"):
+                return line[:150]
         return ""
 
 
@@ -459,17 +466,37 @@ def fetch_topic_images(search_query: str) -> list[str]:
     """
     if not search_query:
         return []
-    try:
-        client = ApifyClient(APIFY_API_TOKEN)
-        run = client.actor(APIFY_IMAGE_ACTOR).call(
+
+    def run_actor(actor: str):
+        result = ApifyClient(APIFY_API_TOKEN).actor(actor).call(
             run_input={
                 "queries": [search_query],
                 "maxResultsPerQuery": 10,
             },
             logger=None,
         )
-        if run is None:
-            raise RuntimeError("image search actor run failed")
+        if result is None:
+            raise RuntimeError(f"image search actor run failed ({actor})")
+        return result
+
+    try:
+        client = ApifyClient(APIFY_API_TOKEN)
+        try:
+            run = run_actor(APIFY_IMAGE_ACTOR)
+        except Exception as exc:  # noqa: BLE001
+            # Self-heal a bad APIFY_IMAGE_ACTOR value (e.g. misspelled slug).
+            if (
+                "not found" in str(exc).lower()
+                and APIFY_IMAGE_ACTOR != DEFAULT_IMAGE_ACTOR
+            ):
+                log.warning(
+                    "Actor %r not found — falling back to %r.",
+                    APIFY_IMAGE_ACTOR,
+                    DEFAULT_IMAGE_ACTOR,
+                )
+                run = run_actor(DEFAULT_IMAGE_ACTOR)
+            else:
+                raise
 
         found: list[str] = []
         for item in client.dataset(run.default_dataset_id).iterate_items():
@@ -673,7 +700,7 @@ def process_video(
             return True
 
         script, search_query = generate_roman_urdu_script(urdu_text, url)
-        about = generate_about_line(urdu_text)
+        about = generate_about_line(urdu_text, script)
         images = fetch_topic_images(search_query)
         sync_to_notion(title_prop, db_props, username, video, script, about, images)
 
