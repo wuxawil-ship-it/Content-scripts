@@ -17,7 +17,8 @@ immediately after a successful Notion sync.
 3. Add these repository secrets (Settings → Secrets and variables → Actions):
    `GEMINI_API_KEY`, `GROQ_API_KEY`, `NOTION_API_KEY`, `NOTION_DATABASE_ID`,
    `APIFY_API_TOKEN`
-4. The workflow runs every 4 hours, or trigger it manually from the Actions tab.
+4. The workflow runs once daily at 6:00 PM Pakistan time (13:00 UTC), or
+   trigger it manually from the Actions tab.
 
 ## Local testing
 
