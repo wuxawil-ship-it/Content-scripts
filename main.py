@@ -86,11 +86,6 @@ GEMINI_MODELS = [
     if m
 ]
 APIFY_INSTAGRAM_ACTOR = "apify/instagram-scraper"
-# Actor used to find topic images; override with APIFY_IMAGE_ACTOR env var.
-# Default is Google Images scraper (input: queries[] + maxResultsPerQuery).
-DEFAULT_IMAGE_ACTOR = "hooli/google-images-scraper"
-APIFY_IMAGE_ACTOR = os.getenv("APIFY_IMAGE_ACTOR", "").strip() or DEFAULT_IMAGE_ACTOR
-MAX_TOPIC_IMAGES = 3
 
 # Below this many transcript characters the video has no usable speech
 # (music-only reels etc.) — skip it instead of failing.
@@ -146,13 +141,6 @@ FORMATTING RESTRICTIONS:
 END CONSTRAINT:
 - Completely exclude any automated captions, emojis, or hashtags from the end
   of the script.
-
-SEARCH QUERY (metadata — stripped before publishing):
-- After the script, add ONE final line in exactly this format:
-  SEARCH_QUERY: <concise English image-search phrase for the video's topic,
-  3-6 words, e.g. "crypto market crash chart" or "bitcoin bullish trend">
-- This line is machine-read and removed from the script automatically, so it
-  does not violate the three-part structure above.
 
 Urdu transcript:
 {urdu_text}
@@ -387,32 +375,13 @@ def _gemini_generate(prompt: str) -> str:
     raise RuntimeError("All Gemini models failed.") from last_error
 
 
-def generate_roman_urdu_script(urdu_text: str, video_url: str) -> tuple[str, str]:
-    """Rewrite the Urdu transcript as a structured Roman Urdu script via Gemini.
-
-    Returns (script, search_query). The SEARCH_QUERY metadata line is parsed
-    out and stripped so it never appears in the published script.
-    """
-    raw = _gemini_generate(
+def generate_roman_urdu_script(urdu_text: str, video_url: str) -> str:
+    """Rewrite the Urdu transcript as a structured Roman Urdu script via Gemini."""
+    script = _gemini_generate(
         SCRIPT_PROMPT.format(video_url=video_url, urdu_text=urdu_text)
     )
-
-    search_query = ""
-    script_lines = []
-    for line in raw.splitlines():
-        match = re.match(r"\s*SEARCH_QUERY\s*:\s*(.+)", line, re.IGNORECASE)
-        if match:
-            search_query = match.group(1).strip().strip('"')
-        else:
-            script_lines.append(line)
-    script = "\n".join(script_lines).strip()
-
-    if not script:
-        raise ValueError("Gemini returned an empty script.")
-    log.info(
-        "Script generated (%d chars, search query: %r)", len(script), search_query
-    )
-    return script, search_query
+    log.info("Script generated (%d chars)", len(script))
+    return script
 
 
 def generate_about_line(urdu_text: str, script: str) -> str:
@@ -431,85 +400,6 @@ def generate_about_line(urdu_text: str, script: str) -> str:
             if line and not line.lower().startswith("http"):
                 return line[:150]
         return ""
-
-
-_IMAGE_URL_RE = re.compile(
-    r"^https?://\S+\.(?:jpg|jpeg|png|webp|gif)(?:\?\S*)?$", re.IGNORECASE
-)
-_IMAGE_KEYS = {"imageUrl", "originalImageUrl", "thumbnailUrl", "image"}
-
-
-def _collect_image_urls(node, found: list[str]) -> None:
-    """Recursively pull image-looking URLs out of an Apify dataset item."""
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if (
-                isinstance(value, str)
-                and value.startswith("http")
-                and (key in _IMAGE_KEYS or _IMAGE_URL_RE.match(value))
-            ):
-                found.append(value)
-            else:
-                _collect_image_urls(value, found)
-    elif isinstance(node, list):
-        for value in node:
-            _collect_image_urls(value, found)
-    elif isinstance(node, str) and _IMAGE_URL_RE.match(node):
-        found.append(node)
-
-
-def fetch_topic_images(search_query: str) -> list[str]:
-    """Find up to MAX_TOPIC_IMAGES image URLs for the topic via an Apify actor.
-
-    Best-effort: any failure logs a warning and returns [] so the page is
-    still created without visual assets.
-    """
-    if not search_query:
-        return []
-
-    def run_actor(actor: str):
-        result = ApifyClient(APIFY_API_TOKEN).actor(actor).call(
-            run_input={
-                "queries": [search_query],
-                "maxResultsPerQuery": 10,
-            },
-            logger=None,
-        )
-        if result is None:
-            raise RuntimeError(f"image search actor run failed ({actor})")
-        return result
-
-    try:
-        client = ApifyClient(APIFY_API_TOKEN)
-        try:
-            run = run_actor(APIFY_IMAGE_ACTOR)
-        except Exception as exc:  # noqa: BLE001
-            # Self-heal a bad APIFY_IMAGE_ACTOR value (e.g. misspelled slug).
-            if (
-                "not found" in str(exc).lower()
-                and APIFY_IMAGE_ACTOR != DEFAULT_IMAGE_ACTOR
-            ):
-                log.warning(
-                    "Actor %r not found — falling back to %r.",
-                    APIFY_IMAGE_ACTOR,
-                    DEFAULT_IMAGE_ACTOR,
-                )
-                run = run_actor(DEFAULT_IMAGE_ACTOR)
-            else:
-                raise
-
-        found: list[str] = []
-        for item in client.dataset(run.default_dataset_id).iterate_items():
-            _collect_image_urls(item, found)
-            if len(found) >= MAX_TOPIC_IMAGES * 3:  # enough candidates
-                break
-
-        unique = list(dict.fromkeys(found))[:MAX_TOPIC_IMAGES]
-        log.info("Found %d topic image(s) for %r", len(unique), search_query)
-        return unique
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Image search failed for %r: %s", search_query, exc)
-        return []
 
 
 def _chunk_text(text: str, size: int = NOTION_TEXT_CHUNK) -> list[str]:
@@ -595,14 +485,13 @@ def sync_to_notion(
     video: dict,
     script: str,
     about: str,
-    images: list[str],
 ) -> None:
     """Create the Notion page — the single source of truth for this pipeline.
 
     Title = creator username, URL property = video link, and the entire Gemini
-    response (link + 4-line hook + script body) becomes the page body,
-    followed by embedded topic images for editing. About and Date columns are
-    filled when the database has them; every page gets the yellow-circle icon.
+    response (link + 4-line hook + script body) becomes the page body. About
+    and Date columns are filled when the database has them; every page gets
+    the yellow-circle icon.
     """
     paragraphs = []
     for block in script.split("\n\n"):
@@ -617,26 +506,6 @@ def sync_to_notion(
                     "paragraph": {
                         "rich_text": [{"type": "text", "text": {"content": chunk}}]
                     },
-                }
-            )
-
-    if images:
-        paragraphs.append({"object": "block", "type": "divider", "divider": {}})
-        paragraphs.append(
-            {
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {
-                    "rich_text": [{"type": "text", "text": {"content": "Visual Assets"}}]
-                },
-            }
-        )
-        for image_url in images:
-            paragraphs.append(
-                {
-                    "object": "block",
-                    "type": "image",
-                    "image": {"type": "external", "external": {"url": image_url}},
                 }
             )
 
@@ -699,10 +568,9 @@ def process_video(
             delete_media(media_path)
             return True
 
-        script, search_query = generate_roman_urdu_script(urdu_text, url)
+        script = generate_roman_urdu_script(urdu_text, url)
         about = generate_about_line(urdu_text, script)
-        images = fetch_topic_images(search_query)
-        sync_to_notion(title_prop, db_props, username, video, script, about, images)
+        sync_to_notion(title_prop, db_props, username, video, script, about)
 
         # Delete ONLY after a successful Notion response — zero retention.
         delete_media(media_path)
