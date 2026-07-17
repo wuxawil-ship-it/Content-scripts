@@ -36,7 +36,12 @@ from main import (
 )
 
 X_ACCOUNTS_FILE = BASE_DIR / "x_accounts.txt"
-APIFY_X_ACTOR = _env("APIFY_X_ACTOR") or "apidojo/tweet-scraper"
+# apidojo actors cap free-plan users at 5 runs/month with 10 items — the
+# kaito actor bills per result ($0.18/1k) against normal platform credit.
+APIFY_X_ACTOR = (
+    _env("APIFY_X_ACTOR")
+    or "kaitoeasyapi/twitter-x-data-tweet-scraper-pay-per-result-cheapest"
+)
 MAX_TWEETS = 80
 PKT = timezone(timedelta(hours=5))
 PAGE_ICON = "🟡"
@@ -106,23 +111,36 @@ def _tweet_images(item: dict) -> list[str]:
     return list(dict.fromkeys(cleaned))[:4]
 
 
+def _actor_input(handles: list[str]) -> dict:
+    """Build the actor input for the configured scraper's schema."""
+    if "kaitoeasyapi" in APIFY_X_ACTOR:
+        query = " OR ".join(f"from:{h}" for h in handles)
+        return {
+            "twitterContent": f"({query})",
+            "queryType": "Latest",
+            "maxItems": MAX_TWEETS,
+        }
+    return {"twitterHandles": handles, "maxItems": MAX_TWEETS, "sort": "Latest"}
+
+
 def fetch_tweets(handles: list[str]) -> list[dict]:
     """Last 24h of tweets from the given handles via Apify."""
     client = ApifyClient(APIFY_API_TOKEN)
     run = client.actor(APIFY_X_ACTOR).call(
-        run_input={
-            "twitterHandles": handles,
-            "maxItems": MAX_TWEETS,
-            "sort": "Latest",
-        },
-        logger=None,
+        run_input=_actor_input(handles), logger=None
     )
     if run is None:
-        raise RuntimeError("tweet scraper actor run failed")
+        raise RuntimeError("tweet scraper actor run failed to start")
+    status = getattr(run, "status", "UNKNOWN")
+    if status != "SUCCEEDED":
+        raise RuntimeError(f"tweet scraper run ended with status {status}")
+
+    raw_items = list(client.dataset(run.default_dataset_id).iterate_items())
+    log.info("Actor returned %d raw item(s)", len(raw_items))
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     tweets: list[dict] = []
-    for item in client.dataset(run.default_dataset_id).iterate_items():
+    for item in raw_items:
         text = (item.get("text") or item.get("fullText") or "").strip()
         if not text or text.startswith("RT @"):
             continue
@@ -144,6 +162,12 @@ def fetch_tweets(handles: list[str]) -> list[dict]:
 
     tweets.sort(key=lambda t: t["created"] or datetime.now(timezone.utc))
     log.info("Fetched %d usable tweet(s) from last 24h", len(tweets))
+    if not tweets and raw_items:
+        # Shape mismatch or actor notice items — surface what came back.
+        log.warning(
+            "No usable tweets despite raw items; first item keys: %s",
+            sorted(raw_items[0])[:20],
+        )
     return tweets
 
 
