@@ -1,0 +1,8 @@
+# X (Twitter) accounts for the daily news digest — one handle per line, no @.
+# Edit freely; good accounts = fast breaking news, crypto + geopolitics.
+rovercrc
+WatcherGuru
+DegenerateNews
+disclosetv
+unusual_whales
+spectatorindex
