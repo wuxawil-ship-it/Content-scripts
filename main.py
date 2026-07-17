@@ -146,9 +146,15 @@ Urdu transcript:
 {urdu_text}
 """
 
-ABOUT_PROMPT = """In ONE short line of Roman Urdu (maximum 12 words), state what
-this video is about. Output only that single line — no quotes, no emojis, no
-hashtags, no trailing punctuation.
+ABOUT_PROMPT = """Analyze the Urdu transcript below and output EXACTLY two lines:
+
+ABOUT: <one short line in Roman Urdu, maximum 12 words, saying what the video
+is about>
+TAG: <one short English category tag, 1-3 words, that describes the topic —
+e.g. "Crypto Update", "Bitcoin", "AI Trading", "Geopolitics", "Altcoins",
+"Trading Psychology", "Market Update", "Regulation">
+
+No quotes, no emojis, no hashtags, no extra lines.
 
 Urdu transcript:
 {urdu_text}
@@ -384,22 +390,32 @@ def generate_roman_urdu_script(urdu_text: str, video_url: str) -> str:
     return script
 
 
-def generate_about_line(urdu_text: str, script: str) -> str:
-    """One-line Roman Urdu summary for the About column. Optional — never fatal.
+def generate_about_and_tag(urdu_text: str, script: str) -> tuple[str, str]:
+    """(About one-liner, topic tag) for the columns. Optional — never fatal.
 
-    Falls back to the script's first hook line if Gemini is unavailable
-    (e.g. still overloaded right after the script call).
+    Falls back to the script's first hook line (and no tag) if Gemini is
+    unavailable, e.g. still overloaded right after the script call.
     """
     try:
-        about = _gemini_generate(ABOUT_PROMPT.format(urdu_text=urdu_text))
-        return about.splitlines()[0].strip()
+        raw = _gemini_generate(ABOUT_PROMPT.format(urdu_text=urdu_text))
+        about = tag = ""
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.upper().startswith("ABOUT:"):
+                about = line[6:].strip()
+            elif line.upper().startswith("TAG:"):
+                tag = line[4:].strip().strip('"')
+        # If Gemini ignored the labels, treat the first line as the About.
+        if not about and raw.strip():
+            about = raw.strip().splitlines()[0]
+        return about, tag
     except Exception as exc:  # noqa: BLE001
-        log.warning("Could not generate About line (%s) — using hook line.", exc)
+        log.warning("Could not generate About/Tag (%s) — using hook line.", exc)
         for line in script.splitlines():
             line = line.strip()
             if line and not line.lower().startswith("http"):
-                return line[:150]
-        return ""
+                return line[:150], ""
+        return "", ""
 
 
 def _chunk_text(text: str, size: int = NOTION_TEXT_CHUNK) -> list[str]:
@@ -452,14 +468,18 @@ def prepare_database() -> tuple[str, set[str]] | None:
         (name for name, p in props.items() if p.get("type") == "title"), "Name"
     )
 
-    if "Instagram URL" not in props:
-        notion_request(
-            "PATCH",
-            f"databases/{NOTION_DATABASE_ID}",
-            {"properties": {"Instagram URL": {"url": {}}}},
-        )
-        props["Instagram URL"] = {"type": "url"}
-        log.info('Added missing "Instagram URL" property to the database.')
+    for prop_name, prop_schema in (
+        ("Instagram URL", {"url": {}}),
+        ("Tags", {"multi_select": {}}),
+    ):
+        if prop_name not in props:
+            notion_request(
+                "PATCH",
+                f"databases/{NOTION_DATABASE_ID}",
+                {"properties": {prop_name: prop_schema}},
+            )
+            props[prop_name] = prop_schema
+            log.info("Added missing %r property to the database.", prop_name)
 
     log.info("Notion database OK (title property: %r).", title_prop)
     return title_prop, set(props)
@@ -485,13 +505,14 @@ def sync_to_notion(
     video: dict,
     script: str,
     about: str,
+    tag: str,
 ) -> None:
     """Create the Notion page — the single source of truth for this pipeline.
 
     Title = creator username, URL property = video link, and the entire Gemini
-    response (link + 4-line hook + script body) becomes the page body. About
-    and Date columns are filled when the database has them; every page gets
-    the yellow-circle icon.
+    response (link + 4-line hook + script body) becomes the page body. About,
+    Tags, and Date columns are filled when the database has them; every page
+    gets the yellow-circle icon.
     """
     paragraphs = []
     for block in script.split("\n\n"):
@@ -519,6 +540,8 @@ def sync_to_notion(
         }
     if video.get("posted_at") and "Date" in db_props:
         properties["Date"] = {"date": {"start": video["posted_at"]}}
+    if tag and "Tags" in db_props:
+        properties["Tags"] = {"multi_select": [{"name": tag[:100]}]}
 
     notion_request(
         "POST",
@@ -569,8 +592,8 @@ def process_video(
             return True
 
         script = generate_roman_urdu_script(urdu_text, url)
-        about = generate_about_line(urdu_text, script)
-        sync_to_notion(title_prop, db_props, username, video, script, about)
+        about, tag = generate_about_and_tag(urdu_text, script)
+        sync_to_notion(title_prop, db_props, username, video, script, about, tag)
 
         # Delete ONLY after a successful Notion response — zero retention.
         delete_media(media_path)
