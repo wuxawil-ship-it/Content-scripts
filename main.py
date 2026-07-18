@@ -98,6 +98,10 @@ NOTION_API_VERSION = "2022-06-28"
 
 # Process only the single latest video per creator for now (may increase later).
 LATEST_VIDEOS_PER_CREATOR = 1
+# Scan this many recent posts to FIND that video — creators who post images/
+# carousels between videos otherwise never surface (their newest post blocks
+# the lookup). 14 creators x 4 posts x 30 days stays within Apify free credit.
+POSTS_TO_SCAN = 4
 
 DOWNLOAD_TIMEOUT_SECONDS = 120
 
@@ -224,7 +228,7 @@ def get_latest_videos(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR) -> 
         run_input={
             "directUrls": [f"https://www.instagram.com/{username}/"],
             "resultsType": "posts",
-            "resultsLimit": limit,  # only the absolute latest posts — conserves Apify credits
+            "resultsLimit": POSTS_TO_SCAN,
             "addParentData": False,
         },
         logger=None,  # don't stream actor logs — keeps CI output readable
@@ -233,9 +237,12 @@ def get_latest_videos(username: str, limit: int = LATEST_VIDEOS_PER_CREATOR) -> 
     if run is None:
         raise RuntimeError(f"Apify actor run failed for @{username}")
 
+    items = list(client.dataset(run.default_dataset_id).iterate_items())
+    # Newest first — pinned posts otherwise appear at the top regardless of age.
+    items.sort(key=lambda i: i.get("timestamp") or "", reverse=True)
+
     videos: list[dict] = []
-    # apify-client returns a Run object — access fields as attributes.
-    for item in client.dataset(run.default_dataset_id).iterate_items():
+    for item in items:
         # Actor marks post types as "Video" / "Image" / "Sidecar".
         if item.get("type") != "Video":
             continue
